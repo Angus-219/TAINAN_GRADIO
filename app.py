@@ -2,11 +2,16 @@ import io
 import os
 import tempfile
 import warnings
+from pathlib import Path
 
 import gradio as gr
 import pandas as pd
 import requests
 import urllib3
+import uvicorn
+from fastapi import FastAPI
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 
 # ------------------------------------------------------------------
 # 設定（皆可用 Render 的環境變數覆蓋）
@@ -18,6 +23,9 @@ URL = os.getenv(
 VERIFY_SSL = os.getenv("VERIFY_SSL", "false").lower() == "true"
 ENCODINGS = ["utf-8-sig", "utf-8", "big5", "cp950"]  # 編碼備援
 TITLE = os.getenv("APP_TITLE", "臺南市開放資料瀏覽器")
+
+BASE_DIR = Path(__file__).resolve().parent
+PWA_DIR = BASE_DIR / "pwa"
 
 if not VERIFY_SSL:
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -122,49 +130,152 @@ def analyze(col, topn):
 
 
 # ------------------------------------------------------------------
+# PWA：<head> 注入（manifest、iOS 設定、Service Worker、安裝按鈕）
+# ------------------------------------------------------------------
+HEAD = """
+<link rel="manifest" href="/manifest.webmanifest">
+<meta name="theme-color" content="#4f46e5">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="南市資料">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<link rel="apple-touch-icon" href="/pwa-assets/icons/apple-touch-icon.png">
+<script>
+  if ("serviceWorker" in navigator) {
+    window.addEventListener("load", function () {
+      navigator.serviceWorker.register("/sw.js", { scope: "/" }).catch(console.warn);
+    });
+  }
+
+  // 自訂「安裝 App」按鈕（Chrome / Edge / Android；iOS 請用「加入主畫面」）
+  var deferredPrompt = null;
+  function removeInstallBtn() {
+    var b = document.getElementById("pwa-install-btn");
+    if (b) b.remove();
+  }
+  window.addEventListener("beforeinstallprompt", function (e) {
+    e.preventDefault();
+    deferredPrompt = e;
+    if (document.getElementById("pwa-install-btn")) return;
+    var btn = document.createElement("button");
+    btn.id = "pwa-install-btn";
+    btn.textContent = "📲 安裝 App";
+    btn.onclick = function () {
+      if (!deferredPrompt) return;
+      deferredPrompt.prompt();
+      deferredPrompt.userChoice.finally(function () {
+        deferredPrompt = null;
+        removeInstallBtn();
+      });
+    };
+    document.body.appendChild(btn);
+  });
+  window.addEventListener("appinstalled", removeInstallBtn);
+</script>
+"""
+
+# ------------------------------------------------------------------
+# RWD：自訂 CSS
+# ------------------------------------------------------------------
+CSS = """
+.gradio-container {
+  max-width: 1200px !important;
+  margin: 0 auto !important;
+}
+.app-title h1 {
+  font-size: clamp(1.4rem, 4.5vw, 2.2rem);
+  line-height: 1.25;
+  margin-bottom: .25rem;
+}
+.app-title p { font-size: clamp(.9rem, 2.8vw, 1.05rem); opacity: .8; }
+
+.toolbar-row { flex-wrap: wrap !important; gap: 8px !important; }
+.toolbar-row > * { min-width: 120px; }
+
+.table-wrap { overflow-x: auto; }
+
+#pwa-install-btn {
+  position: fixed; right: 16px; bottom: 16px; z-index: 9999;
+  background: #4f46e5; color: #fff; border: 0; border-radius: 999px;
+  padding: 12px 20px; font-size: 1rem; min-height: 44px;
+  box-shadow: 0 6px 18px rgba(79, 70, 229, .4); cursor: pointer;
+}
+
+/* 平板以下 */
+@media (max-width: 900px) {
+  .gradio-container { padding-left: 10px !important; padding-right: 10px !important; }
+}
+
+/* 手機 */
+@media (max-width: 640px) {
+  .toolbar-row { flex-direction: column !important; }
+  .toolbar-row > * { width: 100% !important; flex: 1 1 auto !important; min-width: 0 !important; }
+  .gradio-container button, .gradio-container input, .gradio-container select {
+    min-height: 44px;  /* 觸控友善 */
+  }
+  .gradio-container input, .gradio-container textarea { font-size: 16px !important; } /* 避免 iOS 自動放大 */
+  .tab-nav button, button[role="tab"] { padding: 10px 12px !important; }
+}
+
+/* 以 App 形式開啟時 */
+@media (display-mode: standalone) {
+  footer { display: none !important; }
+}
+"""
+
+# ------------------------------------------------------------------
 # 介面
 # ------------------------------------------------------------------
 theme = gr.themes.Soft(primary_hue="indigo", secondary_hue="sky", neutral_hue="slate")
 
-with gr.Blocks(theme=theme, title=TITLE) as demo:
+with gr.Blocks(theme=theme, title=TITLE, css=CSS, head=HEAD, fill_width=True) as demo:
     gr.Markdown(
         f"""
         # 🏙️ {TITLE}
         搜尋、篩選、視覺化並下載臺南市政府開放資料
-        """
+        """,
+        elem_classes="app-title",
     )
 
     with gr.Tabs():
         with gr.TabItem("🔍 資料查詢"):
-            with gr.Row():
+            with gr.Row(elem_classes="toolbar-row"):
                 keyword = gr.Textbox(
                     label="關鍵字搜尋",
                     placeholder="輸入任意文字，會搜尋所有欄位…",
                     scale=4,
+                    min_width=240,
                 )
-                search_btn = gr.Button("搜尋", variant="primary", scale=1)
-                reload_btn = gr.Button("🔄 重新下載資料", scale=1)
+                search_btn = gr.Button("搜尋", variant="primary", scale=1, min_width=120)
+                reload_btn = gr.Button("🔄 重新下載資料", scale=1, min_width=160)
 
             cols_box = gr.CheckboxGroup(label="顯示欄位", choices=[], value=[])
             info_md = gr.Markdown()
             table = gr.Dataframe(
-                label="資料表", interactive=False, wrap=True, max_height=500
+                label="資料表",
+                interactive=False,
+                wrap=True,
+                max_height=500,
+                elem_classes="table-wrap",
             )
             file_out = gr.File(label="⬇️ 下載查詢結果 (CSV)")
 
         with gr.TabItem("📈 統計圖表"):
-            with gr.Row():
-                ana_col = gr.Dropdown(label="選擇統計欄位", choices=[])
-                topn = gr.Slider(5, 50, value=10, step=1, label="顯示前 N 名")
+            with gr.Row(elem_classes="toolbar-row"):
+                ana_col = gr.Dropdown(label="選擇統計欄位", choices=[], min_width=220)
+                topn = gr.Slider(5, 50, value=10, step=1, label="顯示前 N 名", min_width=220)
             plot = gr.BarPlot(
                 x="類別",
                 y="數量",
                 sort="-y",
                 title="欄位次數分布",
                 height=400,
+                x_label_angle=-30,  # 手機上長標籤不重疊
                 label="長條圖",
             )
-            stat_table = gr.Dataframe(label="統計明細", interactive=False)
+            stat_table = gr.Dataframe(
+                label="統計明細", interactive=False, elem_classes="table-wrap"
+            )
 
     q_inputs = [keyword, cols_box]
     q_outputs = [info_md, table, file_out]
@@ -188,7 +299,57 @@ with gr.Blocks(theme=theme, title=TITLE) as demo:
     topn.release(analyze, a_inputs, a_outputs)  # 放開滑鼠才觸發
 
 
+# ------------------------------------------------------------------
+# FastAPI：提供 PWA 檔案（Service Worker 必須由根路徑提供才能控制整站）
+# ------------------------------------------------------------------
+app = FastAPI(title=TITLE)
+
+
+@app.get("/manifest.webmanifest", include_in_schema=False)
+def manifest():
+    return FileResponse(
+        PWA_DIR / "manifest.webmanifest", media_type="application/manifest+json"
+    )
+
+
+@app.get("/sw.js", include_in_schema=False)
+def service_worker():
+    return FileResponse(
+        PWA_DIR / "sw.js",
+        media_type="application/javascript",
+        headers={"Service-Worker-Allowed": "/", "Cache-Control": "no-cache"},
+    )
+
+
+@app.get("/offline.html", include_in_schema=False)
+def offline():
+    return FileResponse(PWA_DIR / "offline.html", media_type="text/html")
+
+
+@app.get("/healthz", include_in_schema=False)
+def healthz():
+    return {"status": "ok"}
+
+
+app.mount("/pwa-assets", StaticFiles(directory=PWA_DIR), name="pwa-assets")
+
+# Gradio 掛在根路徑；上面先註冊的路由優先比對
+app = gr.mount_gradio_app(
+    app,
+    demo.queue(),
+    path="/",
+    favicon_path=str(PWA_DIR / "icons" / "icon-192.png"),
+    allowed_paths=[tempfile.gettempdir()],
+)
+
+
 if __name__ == "__main__":
     # Render 會提供 PORT 環境變數，且必須綁定 0.0.0.0
     port = int(os.getenv("PORT", "7860"))
-    demo.queue().launch(server_name="0.0.0.0", server_port=port)
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=port,
+        proxy_headers=True,       # 讓 https 在反向代理後仍被正確識別
+        forwarded_allow_ips="*",
+    )
