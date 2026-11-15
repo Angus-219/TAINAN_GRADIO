@@ -141,10 +141,16 @@ HEAD = """
 <meta name="apple-mobile-web-app-status-bar-style" content="default">
 <link rel="apple-touch-icon" href="/pwa-assets/icons/apple-touch-icon.png">
 <script>
+  // Gradio 可能在 load 事件之後才注入這段 script，所以要先判斷頁面是否已載入完成
   if ("serviceWorker" in navigator) {
-    window.addEventListener("load", function () {
-      navigator.serviceWorker.register("/sw.js", { scope: "/" }).catch(console.warn);
-    });
+    var regSW = function () {
+      navigator.serviceWorker
+        .register("/sw.js", { scope: "/" })
+        .then(function (r) { console.log("[PWA] Service Worker 註冊成功", r.scope); })
+        .catch(function (err) { console.warn("[PWA] Service Worker 註冊失敗", err); });
+    };
+    if (document.readyState === "complete") { regSW(); }
+    else { window.addEventListener("load", regSW); }
   }
 
   // 自訂「安裝 App」按鈕（Chrome / Edge / Android；iOS 請用「加入主畫面」）
@@ -171,6 +177,24 @@ HEAD = """
     document.body.appendChild(btn);
   });
   window.addEventListener("appinstalled", removeInstallBtn);
+
+  // iOS Safari 不支援 beforeinstallprompt，改顯示「加入主畫面」說明按鈕
+  window.addEventListener("load", function () {
+    var isIOS = /iphone|ipad|ipod/i.test(navigator.userAgent);
+    var standalone = window.navigator.standalone === true;
+    if (isIOS && !standalone) {
+      setTimeout(function () {
+        if (document.getElementById("pwa-install-btn")) return;
+        var btn = document.createElement("button");
+        btn.id = "pwa-install-btn";
+        btn.textContent = "📲 加入主畫面";
+        btn.onclick = function () {
+          alert("請點 Safari 下方的「分享」按鈕，再選「加入主畫面」。");
+        };
+        document.body.appendChild(btn);
+      }, 1500);
+    }
+  });
 </script>
 """
 
